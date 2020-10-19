@@ -1,0 +1,476 @@
+---
+title: "Circular Permutations"
+author: 
+  - name: "Teun van den Brand"
+    email: "t.vd.brand@nki.nl"
+    affiliation: "Netherlands Cancer Institute"
+date: '2020-10-09'
+output: 
+  html_document:
+    theme: united
+    highlight: pygments
+    fig_caption: yes
+    code_folding: hide
+    df_print: kable
+    toc: true
+    toc_depth: 4
+    toc_float:
+      collapsed: false
+---
+
+## Setup {.tabset}
+
+<!-- little HTML script to do indentation of the table of contents -->
+<script>
+    $(document).ready(function() {
+      $items = $('div#TOC li');
+      $items.each(function(idx) {
+        num_ul = $(this).parentsUntil('#TOC').length;
+        $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+      });
+
+    });
+</script>
+
+```{css, echo = FALSE}
+div.sourceCode {
+  overflow-x: hidden;
+}
+```
+
+### Load packages
+
+```{r load_packages, results = 'hide', warning = FALSE, message = FALSE}
+library(rtracklayer)
+library(GenomicRanges)
+library(regioneR)
+library(abind)
+library(BiocParallel)
+library(Biostrings)
+
+library(magrittr)
+library(gt)
+library(ggplot2)
+```
+
+### Data
+
+#### Files
+
+```{r}
+project_dir <- "/DATA/projects/ES_Wapl_AID/"
+get_file <- function(file) paste0(project_dir, file)
+
+# BED file with loss and gain regions of Rad21
+gain_loss_file <- paste0(
+  project_dir,
+  "ChIPseq/Normalized_SIChIP/gainloss_201906/rad21_loss_gain_merged_2019-06.bed"
+)
+
+# BED File with transcription start sites
+tss_file <- paste0(
+  project_dir,
+  "ChIPseq/WCR_ChIP/Rad21_loss_gain/mm10_tss/Ensembl_id_annotation_mm10_all_geneTSS_2019-03-19.bed"
+)
+
+# Files with differential expression results (DEseq2)
+DE_files <- setNames(paste0(
+  project_dir, "WAPL_revision/",
+  c(
+    "Permutation_WAPL-C6/Wapl_all_fdr0.05_2020-08-13.txt",
+    "RNA/WAPLC20/analysis/WAPL-C20_significant_genes_2020-05-29.txt",
+    "Permutation_WAPL-C6/Rad21_all_fdr0.05_2020-08-13.txt",
+    "TTchem_finalized/analysis/WAPL-TTchem_significant_genes_WAPLC6_only_2020-07-14.txt"
+  )
+), c("WAPL_C6", "WAPL_C20", "RAD21_AID", "TTCHEM"))
+```
+
+#### Loading
+
+```{r load_data}
+regions <- import.bed(gain_loss_file)
+tss <- read.delim(tss_file, header = FALSE,
+                  stringsAsFactors = FALSE)
+rna_results <- lapply(DE_files, read.table, 
+                      header = TRUE, stringsAsFactors = FALSE)
+```
+
+### Setup Aesthetics
+
+```{r setup_aes}
+mycolour <- "#000000FF" # Opaque Black
+
+theme_set(theme_gray())
+theme_update(text = element_text(colour = mycolour),
+             line = element_line(colour = mycolour),
+             aspect.ratio = 1,
+             axis.line  = element_line(colour = mycolour),
+             axis.ticks = element_line(colour = mycolour),
+             axis.text  = element_text(colour = mycolour),
+             legend.key = element_blank(),
+             panel.background = element_blank(),
+             panel.grid.major = element_line(colour = "grey95"),
+             panel.grid.major.x = element_blank(),
+             panel.spacing.y = unit(10, "pt"),
+             panel.grid.minor = element_blank(),
+             plot.background  = element_blank(),
+             strip.background = element_blank(),
+             strip.text = element_text(colour = mycolour))
+
+rm(mycolour)
+```
+
+### Functions
+
+```{r}
+tally_nearest <- function(regions, genes) {
+  # Find nearest genes
+  near <- nearest(regions, genes, select = "all")
+  
+  # Exclude genes that are nearest for both a gain and a loss regions
+  type <- regions$name[from(near)]
+  type <- split(to(near), type)
+  delete <- intersect(type$gain, type$loss)
+  near <- near[!(to(near) %in% delete)]
+  
+  # Only count a gene once, even if nearest for two regions
+  near <- near[!duplicated(to(near))]
+  
+  # Decode hits to features
+  nearby_genes <- mcols(genes[to(near)])
+  target <- regions$name[from(near)]
+  
+  # Tally per category
+  counts <- lapply(nearby_genes, function(i){
+    as.matrix(table(target, direction = i))
+  })
+  
+  # Format as array
+  counts <- do.call(abind, list(counts, along = 3))
+}
+```
+
+
+## Aim
+
+Permute called Rad21 gain/loss domains and intersect with up/down regulated genes to see if there is an enrichment in some conditions.
+
+## Data wrangling
+
+Getting all the data in the right format; that is the location of the TSS annotated with the direction of the gene in every dataset/timepoint sampleset.
+
+### Genes
+
+We keep the TSSs from protein coding genes that were tested for differential expression.
+
+```{r}
+# Convert protein coding TSSs to GRanges
+tss <- tss[tss$V7 == "protein_coding",]
+tss <- with(tss, setNames(GRanges(V1, IRanges(V2 + 1, V3)), V5))
+
+# Convert genespaces to TSS locations
+genespaces <- lapply(lapply(rna_results,  `[[`, "ensembl_gene_id"), unique)
+genespaces <- lapply(genespaces, function(i) {
+  tss[intersect(i, names(tss))]
+})
+
+all_genes <- Reduce(union, lapply(genespaces, names))
+tss <- tss[all_genes]
+```
+
+### DE Results
+
+```{r}
+# Subset by genes we approved above
+rna_results <- mapply(function(res, space) {
+  res[res$ensembl_gene_id %in% names(space), ]
+}, res = rna_results, space = genespaces, SIMPLIFY = FALSE)
+
+# Combine RNA results
+rna <- data.table::rbindlist(rna_results, idcol = "dataset")
+data.table::setDF(rna)
+
+# Split RNA results by dataset/time
+rna <- split(rna, interaction(rna$dataset, rna$time, drop = TRUE))
+dataset <- data.table::tstrsplit(names(rna), "\\.")[[1]]
+
+# Annotate gene change direction
+rna <- mapply(function(set, space) {
+  # note: log fold changes are in reverse for some reason
+  up <- subset(set, log2FoldChange < 0 & !is.na(padj) & padj < 0.05, 
+               ensembl_gene_id)[[1]]
+  down <- subset(set, log2FoldChange > 0 & !is.na(padj) & padj < 0.05,
+                 ensembl_gene_id)[[1]]
+  
+  factor(ifelse(
+    all_genes %in% up, "up",
+    ifelse(all_genes %in% down, "down",
+           # Use 'void' factor for genes not in the genespace at all
+           ifelse(all_genes %in% names(space), "neutral", "void")
+           )
+  ), levels = c("up", "down", "neutral", "void"))
+}, set = rna, space = genespaces[dataset], SIMPLIFY = FALSE)
+
+# Append as metadata to TSSs
+rna <- do.call(cbind.data.frame, rna)
+mcols(tss) <- as(rna, "DataFrame")
+
+# For efficiency, convert TSS to nested containment list
+tss <- as(tss, "GNCList")
+```
+
+## Circular permutations
+
+We circularly permute the Rad21 gain and loss regions with the `regionR` package.
+
+```{r}
+# Setup permutations
+n <- 10000
+set.seed(0)
+seeds <- sample(10e6, n)
+genome <- getGenomeAndMask("mm10", mask = NA)$genome
+cores <- MulticoreParam(workers = 10)
+
+# Circularly permute
+random_regions <- bplapply(seeds, function(seed) {
+  set.seed(seed)
+  circularRandomizeRegions(
+    regions, 
+    genome = genome, make = NA, per.chromosome = FALSE
+  )
+}, BPPARAM = cores)
+```
+
+## Calculating overlaps
+
+For every RNA set of DE genes, we calculate the number of genes that are nearby Rad21 loss or gain regions.
+
+### Real data
+
+```{r}
+# The `tally_nearest()` function is defined in the setup of this document.
+counts <- tally_nearest(regions, tss)
+
+# Drop 'void' class
+not_void <- which(dimnames(counts)[[2]] != "void")
+counts <- counts[, not_void, ]
+```
+
+### Permuted data
+
+```{r}
+# Use tally_nearest for every permutation seperately
+perm <- bplapply(
+  random_regions, tally_nearest,
+  genes = tss, BPPARAM = cores
+)
+perm <- do.call(abind, list(perm, along = 4))
+
+# Drop 'void' class
+not_void <- which(dimnames(perm)[[2]] != "void")
+perm <- perm[, not_void, , ]
+
+# Add permutation number as name
+dimnames(perm)[[4]] <- seq_len(n)
+```
+
+## Calculating statistics
+
+### Observed over expected
+
+The 'observed' part is the number of nearest genes whereas the expected part is the sum of observed genes times the background frequency of genes across the whole dataset.
+
+```{r}
+# Calculate background frequency of up/down/neutral genes per dataset/timepoint
+bg_freqs <- lapply(mcols(tss), function(i) {
+  # Drop void class (the 4th factor level)
+  tab <- table(direction = i)[-4]
+  tab / sum(tab)
+})
+
+obsexp_real <- lapply(setNames(nm = names(bg_freqs)), function(i) {
+  obs <- counts[, , i]
+  exp <- t(t(rowSums(obs))) %*% bg_freqs[[i]]
+  # Guard against dividing by 0
+  obs / pmax(exp, 1e-8) 
+})
+obsexp_real <- do.call(abind, list(obsexp_real, along = 3))
+
+obsexp_perm <- vapply(seq_len(n), function(j) {
+  permed <- perm[, , , j]
+  obsexp <- lapply(setNames(nm = names(bg_freqs)), function(i) {
+    obs <- permed[, , i]
+    exp <- t(t(rowSums(obs))) %*% bg_freqs[[i]]
+    # Guard against dividing by 0
+    obs / pmax(exp, 1e-8)
+  })
+  do.call(abind, list(obsexp, along = 3))
+}, obsexp_real)
+```
+
+### Count extremes and quantiles
+
+To estimate P-values empirically we need to count the number that a permuted observed over expected value exceeds the observed over expected value of the true dataset. 
+
+```{r}
+# Take all combinations of Rad21 regions, gene direction and datasets
+idx <- expand.grid(dimnames(obsexp_real))
+
+# Count values in permuted larger than real
+greater <- apply(idx, 1, function(i) {
+  real_val <- obsexp_real[i[[1]], i[[2]], i[[3]]]
+  perm_val <- obsexp_perm[i[[1]], i[[2]], i[[3]], ]
+  sum(perm_val > real_val)
+})
+
+# Count values in permuted smaller than real
+smaller <- apply(idx, 1, function(i) {
+  real_val <- obsexp_real[i[[1]], i[[2]], i[[3]]]
+  perm_val <- obsexp_perm[i[[1]], i[[2]], i[[3]], ]
+  sum(perm_val < real_val)
+})
+
+# Calculate P values
+p_val <- vapply(greater, function(ngreater) {
+  statmod::permp(ngreater, n, total.nperm = sum(seqlengths(genome)))
+}, numeric(1))
+fdr_val <- p.adjust(p_val, method = "fdr")
+
+# Calculate quantiles
+# 95% confidence interval and quartiles
+quantiles <- c(0.025, 0.25, 0.5, 0.75, 0.975)
+quantiles <- apply(obsexp_perm, 1:3, quantile, quantiles)
+quantiles <- reshape2::melt(quantiles)
+quantiles <- tidyr::pivot_wider(quantiles, 
+                                names_from = Var1, values_from = value)
+```
+
+## Summary table
+
+```{r}
+summary <- reshape2::melt(obsexp_real)
+sample <- data.table::tstrsplit(summary$Var3, "\\.")
+
+# Check if the ordering is OK
+assumptions <- c(
+  all(idx$Var1 == summary$Var1),
+  all(idx$Var2 == summary$Var2),
+  all(idx$Var3 == summary$Var3),
+  all(idx$Var1 == quantiles$Var2),
+  all(idx$Var2 == quantiles$Var3),
+  all(idx$Var3 == quantiles$Var4)
+)
+if (!all(assumptions)) {
+  print("Not all ordering assumptions have been met!")
+}
+
+# Gather all summary data
+summary <- data.frame(
+  Rad21 = factor(as.character(summary$Var1), 
+                 levels = c("gain", "loss")),
+  Direction = factor(as.character(summary$Var2), 
+                     levels = c("down", "neutral", "up")),
+  Dataset = factor(sample[[1]], 
+                   c("WAPL_C6", "WAPL_C20", "RAD21_AID", "TTCHEM")),
+  Timepoint = factor(sample[[2]], 
+                     levels = c("6h", "24h", "48h", "96h"), ordered = TRUE),
+  ObsExp = summary$value,
+  Smaller = smaller,
+  Greater = greater,
+  quantiles[, -c(1:3)], 
+  Pval = p_val,
+  FDRval = fdr_val,
+  check.names = FALSE
+)
+
+# Print pretty table
+gt(summary) %>%
+  tab_spanner("Permutation percentiles", colnames(quantiles)[-c(1:3)]) %>%
+  tab_spanner("Condition", vars(Rad21, Direction, Dataset, Timepoint)) %>%
+  tab_spanner("# Permutations", vars(Smaller, Greater)) %>%
+  fmt_number(c("ObsExp", colnames(quantiles)[-c(1:3)])) %>%
+  fmt(vars(Pval, FDRval), fns = scales::pvalue) %>%
+  tab_style(
+    cell_text(color = "red", weight = "bold"),
+    locations = cells_body(vars(FDRval), rows = FDRval < 0.05)
+  )
+```
+
+## Visualise
+
+### Data formatting
+
+```{r}
+realdat <- summary
+realdat$labels <- ""
+realdat$labels[realdat$FDRval < 0.01] <- "*"
+realdat$labels[realdat$FDRval < 0.001] <- "**"
+realdat$labels[realdat$FDRval < 0.0001] <- "***"
+
+permdat <- reshape2::melt(obsexp_perm)
+sample  <- data.table::tstrsplit(permdat$Var3, "\\.")
+permdat <- permdat[, -c(3, 4)]
+names(permdat) <- c("Rad21", "Direction", "ObsExp")
+permdat <- transform(
+  permdat,
+  Dataset = factor(sample[[1]], 
+                   levels = levels(realdat$Dataset)),
+  Timepoint = factor(sample[[2]], 
+                     levels = levels(realdat$Timepoint)),
+  Rad21 = factor(as.character(Rad21), 
+                 levels = levels(realdat$Rad21)),
+  Direction = factor(as.character(Direction), 
+                     levels = levels(realdat$Direction))
+)
+
+realdat <- split(realdat, realdat$Dataset)
+permdat <- split(permdat, permdat$Dataset)
+```
+
+### Plotting {.tabset}
+
+```{r, results = 'asis'}
+plots <- mapply(function(df_real, df_perm) {
+  ggplot(df_real, aes(Timepoint, ObsExp)) +
+    geom_violin(
+      data = df_perm,
+      aes(colour = Rad21, fill = after_scale(colorspace::lighten(colour, 0.3))),
+      adjust = 4, draw_quantiles = c(0.25, 0.5, 0.75), scale = "width"
+    ) +
+    geom_point(shape = "\u2605", size = 5) +
+    geom_text(aes(label = labels), nudge_y = 1) +
+    scale_y_continuous(
+      name = expression(frac("Observed", "Expected")),
+      expand = c(0,0), 
+      breaks = scales::breaks_extended(Q = c(1, 2, 5)),
+      limits = function(x) {c(0, x[2] + 1)}
+    ) +
+    scale_x_discrete(name = "") +
+    scale_colour_brewer(name = "Rad21 Domain", palette = "Set1") +
+    facet_grid(Rad21 ~ Direction) +
+    theme(aspect.ratio = (1 + sqrt(5))/2) +
+    ggtitle(df_real$Dataset[[1]])
+}, df_real = realdat, df_perm = permdat, SIMPLIFY = FALSE)
+
+for (i in names(plots)) {
+  cat(paste0("\n\n#### ", i, "\n"))
+  print(plots[[i]])
+}
+```
+
+## Session Info
+
+<p>
+  <a class="btn btn-primary" data-toggle="collapse" href="#sinfo" role="button" aria-expanded="false" aria-controls="sinfo">
+    View
+  </a>
+</p>
+<div class="collapse" id="sinfo">
+  <div class="card card-body">
+
+```{r session_info, include=TRUE, echo=FALSE}
+utils::sessionInfo()
+```
+
+  </div>
+</div>
